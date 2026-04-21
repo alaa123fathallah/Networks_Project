@@ -1,0 +1,10 @@
+# whitelist.txt
+# One domain or IP address per line.
+# Lines starting with '#' are treated as comments and ignored.
+# This file is only used when WHITELIST_MODE = True in config.py.
+# Only hosts listed here will be allowed; all others are blocked.
+#
+# Examples:
+# example.com
+# httpbin.org
+# 93.184.216.34

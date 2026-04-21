@@ -1,12 +1,18 @@
-import socket  # for creating network connections
+import socket     # for creating network connections
 import threading  # to handle each client in its own thread
-import select  # to monitor multiple sockets at once (used in CONNECT tunneling)
-import time  # for timing connections
+import select    # to monitor multiple sockets at once (used in CONNECT tunneling)
+import time      # for timing connections
+import ssl       # for wrapping sockets with TLS (Bonus H)
 
-from config import PROXY_PORT, SOCKET_TIMEOUT, BUFFER_SIZE  # proxy settings
+from config import (PROXY_PORT, SOCKET_TIMEOUT, BUFFER_SIZE,
+                     MITM_ENABLED, ADMIN_ENABLED)  # proxy settings
 from logger import logger  # for logging
 from cache import cache  # the shared response cache
 from filter import is_allowed, blocked_response  # host filtering
+from admin import increment_stat, start_admin_server  # admin stats + server (Bonus I)
+
+if MITM_ENABLED:  # only import cert tools when MITM is turned on
+    from certs import generate_ca, create_mitm_ssl_context  # Bonus H
 
 
 def parse_request(raw: bytes):
@@ -144,6 +150,12 @@ def handle_connect(client_sock: socket.socket, parsed: dict,
     host = parsed["host"]
     port = parsed["port"]
 
+    # --- Bonus H: MITM interception when enabled ---
+    if MITM_ENABLED:
+        handle_connect_mitm(client_sock, parsed, client_addr)  # use MITM path
+        return
+
+    # --- Standard CONNECT tunnel (no decryption) ---
     try:
         origin_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         origin_sock.settimeout(SOCKET_TIMEOUT)
@@ -183,6 +195,87 @@ def handle_connect(client_sock: socket.socket, parsed: dict,
         origin_sock.close()  # always close the server-side socket
 
 
+# ---------------------------------------------------------------------------
+# Bonus H – MITM HTTPS Interception
+# Instead of blindly tunneling, we decrypt the TLS traffic using a fake cert,
+# read the HTTP request inside, forward it over TLS to the origin, and relay
+# the response back to the client.
+# ---------------------------------------------------------------------------
+
+def handle_connect_mitm(client_sock: socket.socket, parsed: dict,
+                        client_addr: tuple) -> None:
+    host = parsed["host"]
+    port = parsed["port"]
+
+    # step 1: tell the client the tunnel is ready (before we wrap with TLS)
+    client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+
+    try:
+        # step 2: wrap the client socket with our fake cert for this host
+        mitm_ctx = create_mitm_ssl_context(host)  # generate cert signed by our CA
+        client_tls = mitm_ctx.wrap_socket(client_sock, server_side=True)  # TLS handshake with client
+    except Exception as exc:
+        logger.error(f"MITM TLS handshake failed for {host} – {exc}")
+        return
+
+    try:
+        # step 3: read the decrypted HTTP request from the client
+        client_tls.settimeout(SOCKET_TIMEOUT)
+        raw_request = b""
+        while b"\r\n\r\n" not in raw_request:  # read until we have full headers
+            chunk = client_tls.recv(BUFFER_SIZE)
+            if not chunk:
+                break
+            raw_request += chunk
+
+        if not raw_request:
+            return  # client sent nothing
+
+        inner_parsed = parse_request(raw_request)  # parse the inner HTTP request
+        if inner_parsed is None:
+            logger.warning(f"MITM: malformed inner request from {client_addr}")
+            return
+
+        inner_parsed["host"] = host   # make sure host/port match the CONNECT target
+        inner_parsed["port"] = port
+
+        logger.info(
+            f"MITM INTERCEPT {client_addr[0]}:{client_addr[1]} "
+            f"{inner_parsed['method']} https://{host}{inner_parsed['path']}"
+        )
+
+        # step 4: connect to the real server over TLS
+        origin_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        origin_sock.settimeout(SOCKET_TIMEOUT)
+        origin_ctx = ssl.create_default_context()  # use system CA store for the real connection
+        origin_tls = origin_ctx.wrap_socket(origin_sock, server_hostname=host)  # TLS to origin
+        origin_tls.connect((host, port))
+
+        # step 5: forward the request to the origin server
+        forward_req = build_forwarded_request(inner_parsed, raw_request)
+        origin_tls.sendall(forward_req)  # send the request
+        response = recv_all(origin_tls)  # read the full response
+        origin_tls.close()
+
+        # step 6: send the response back to the client through TLS
+        if response:
+            client_tls.sendall(response)
+            increment_stat("bytes_transferred", len(response))  # track bytes for admin
+
+        logger.info(
+            f"MITM DONE {client_addr[0]}:{client_addr[1]} "
+            f"https://{host}{inner_parsed['path']} | {len(response)}B"
+        )
+
+    except Exception as exc:
+        logger.error(f"MITM error for {host} – {exc}")
+    finally:
+        try:
+            client_tls.close()  # close the TLS-wrapped client socket
+        except Exception:
+            pass
+
+
 def handle_http(client_sock: socket.socket, parsed: dict,
                 raw_request: bytes, client_addr: tuple) -> None:
     method = parsed["method"]
@@ -199,6 +292,8 @@ def handle_http(client_sock: socket.socket, parsed: dict,
                 f"GET {url}"
             )
             client_sock.sendall(cached)  # send cached response directly
+            increment_stat("cache_hits")  # track cache hit for admin dashboard
+            increment_stat("bytes_transferred", len(cached))  # track bytes
             return
 
     forward_request = build_forwarded_request(parsed, raw_request)  # build the request to forward
@@ -226,6 +321,7 @@ def handle_http(client_sock: socket.socket, parsed: dict,
     if response:
         try:
             client_sock.sendall(response)  # forward the response to the client
+            increment_stat("bytes_transferred", len(response))  # track bytes for admin
         except Exception as exc:
             logger.warning(f"Failed to send response to client – {exc}")
 
@@ -244,6 +340,8 @@ def handle_http(client_sock: socket.socket, parsed: dict,
 
 def handle_client(client_sock: socket.socket, client_addr: tuple) -> None:
     start_time = time.time()  # track how long the connection takes
+    increment_stat("total_requests")       # count every incoming connection
+    increment_stat("active_connections")   # track currently open connections
     try:
         client_sock.settimeout(SOCKET_TIMEOUT)
         raw_request = b""
@@ -274,6 +372,7 @@ def handle_client(client_sock: socket.socket, client_addr: tuple) -> None:
 
         if not is_allowed(host):  # check blacklist/whitelist
             client_sock.sendall(blocked_response(host))  # send 403 if blocked
+            increment_stat("blocked_requests")  # track blocked request for admin
             logger.info(
                 f"BLOCKED {client_addr[0]}:{client_addr[1]} "
                 f"{method} {url}"
@@ -290,6 +389,7 @@ def handle_client(client_sock: socket.socket, client_addr: tuple) -> None:
     except Exception as exc:
         logger.error(f"handle_client error ({client_addr}): {exc}")
     finally:
+        increment_stat("active_connections", -1)  # one less active connection
         elapsed = time.time() - start_time  # compute how long this connection lasted
         logger.debug(
             f"Connection closed {client_addr[0]}:{client_addr[1]} "
@@ -302,6 +402,16 @@ def handle_client(client_sock: socket.socket, client_addr: tuple) -> None:
 
 
 def start_proxy(port: int = PROXY_PORT) -> None:
+    # --- Bonus H: generate CA certificate on first run ---
+    if MITM_ENABLED:
+        generate_ca()  # create CA key + cert if they don't already exist
+        logger.info("MITM mode is ON – HTTPS traffic will be intercepted")
+
+    # --- Bonus I: start the admin dashboard ---
+    if ADMIN_ENABLED:
+        from config import ADMIN_PORT  # import here to avoid circular issues
+        start_admin_server(ADMIN_PORT)  # launch admin on its own thread
+
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # allow reuse of the port
     server_sock.bind(("0.0.0.0", port))  # listen on all interfaces

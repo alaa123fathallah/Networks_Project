@@ -1,0 +1,10 @@
+# blacklist.txt
+# One domain or IP address per line.
+# Lines starting with '#' are treated as comments and ignored.
+# The proxy will return a 403 Forbidden response for any request to these hosts.
+#
+# Examples:
+# ads.example.com
+# malware-site.net
+# 192.168.1.50
+

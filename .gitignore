@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+proxy.log
+ca_cert.pem
+ca_key.pem
+*.srl

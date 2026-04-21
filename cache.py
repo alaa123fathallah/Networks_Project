@@ -52,6 +52,20 @@ class Cache:
         with self._lock:
             return len(self._store)  # return number of cached entries
 
+    def entries(self) -> list:
+        """Return a snapshot of all cache entries for the admin dashboard."""
+        with self._lock:
+            now = time.time()  # current time for computing remaining TTL
+            result = []
+            for key, entry in self._store.items():
+                remaining = max(0, entry.expires_at - now)  # seconds left before expiry
+                result.append({
+                    "key": key,
+                    "size": len(entry.response),  # response size in bytes
+                    "ttl_remaining": round(remaining, 1),  # how long until it expires
+                })
+            return result
+
     @staticmethod
     def _ttl_from_headers(headers: dict) -> Optional[float]:
         cache_control = headers.get("cache-control", "")  # read Cache-Control header
